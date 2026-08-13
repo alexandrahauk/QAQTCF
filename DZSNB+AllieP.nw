@@ -1,0 +1,14 @@
+# Q atom: Quantum proton from DZSNB (see: https://doi.org/10.1063/1.1494980)
+# Adding my own p orbital to hopefully captures nuclear movement for IR spectrum
+#
+# note to self: firt number is exponent coeff, second is coefficient in front
+# higher exponent coeff means more concentrated at center (less diffuse)
+
+S
+BASIS "ao basis" SPHERICAL PRINT
+Q    S
+      0.2929250000E+02       1.0000000
+Q    S
+      0.2017583000E+02       1.0000000
+Q    P
+      15.000000000000        1.0000000

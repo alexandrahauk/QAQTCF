@@ -1,0 +1,7 @@
+# Q atom: Quantum proton from DZSNB (see: https://doi.org/10.1063/1.1494980)
+S
+BASIS "ao basis" SPHERICAL PRINT
+Q    S
+      0.2929250000E+02       1.0000000
+Q    S
+      0.2017583000E+02       1.0000000
