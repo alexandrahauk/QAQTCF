@@ -1,4 +1,4 @@
-# Q atom: Quantum proton from DZSNB (see: https://doi.org/10.1063/1.1494980)
+# Q atom: Quantum proton from DZSNB (see: `https://doi.org/10.1063/1.1494980`)
 S
 BASIS "ao basis" SPHERICAL PRINT
 Q    S
