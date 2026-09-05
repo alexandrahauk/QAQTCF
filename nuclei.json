@@ -1,0 +1,23 @@
+{
+  "e": {
+    "charge": -1,
+    "mass": 1,
+    "spin": 2,
+    "fermion": true,
+    "isotope": "electron"
+  },
+  "H": {
+    "charge": 1,
+    "mass": 1836.15267,
+    "spin": 2,
+    "fermion":  true,
+    "isotope": "H-1"
+  },
+  "Li": {
+    "charge": 3,
+    "mass": 12789.392,
+    "spin": 4,
+    "fermion": false,
+    "isotope": "Li-7"
+  }
+}

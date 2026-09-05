@@ -3,14 +3,11 @@
 #
 # note to self: firt number is exponent coeff, second is coefficient in front
 # higher exponent coeff means more concentrated at center (less diffuse)
-
-SSS
+# Q atom: Quantum proton from DZSPN (see: `https://doi.org/10.1063/1.1494980`)
+# double zeta s, p nuclear basis set
+S
 BASIS "ao basis" SPHERICAL PRINT
 Q    S
-      0.2929250000E+02       1.0000000
-Q    S
-      0.2017583000E+02       1.0000000
+      29.29266       1.0000000
 Q    P
-      25.059320000000        1.0000000
-Q    P
-      4.5059320000000        1.0000000
+      26.16688       1.0000000

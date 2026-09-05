@@ -1,0 +1,12 @@
+# Q atom: Quantum proton from DZSPN (see: `https://doi.org/10.1063/1.1494980`)
+# double zeta s, p nuclear basis set
+S
+BASIS "ao basis" SPHERICAL PRINT
+Q    S
+      29.29266       1.0000000
+Q    S
+      20.17583       1.0000000
+Q    P
+      26.16688       1.0000000
+Q    P
+      18.21766       1.0000000
