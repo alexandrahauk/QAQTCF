@@ -1,0 +1,22 @@
+# Q atom: Quantum proton from DZSPN (see: `https://doi.org/10.1063/1.1494980`)
+# double zeta s, p nuclear basis set
+S
+BASIS "ao basis" SPHERICAL PRINT
+H    S
+      29.29266       1.0000000
+H    S
+      20.17583       1.0000000
+H    P
+      26.16688       1.0000000
+H    P
+      18.21766       1.0000000
+
+# using the same orbitals because not sure what to expect for Li?
+Li    S
+      29.29266       1.0000000
+Li    S
+      20.17583       1.0000000
+Li    P
+      26.16688       1.0000000
+Li    P
+      18.21766       1.0000000
