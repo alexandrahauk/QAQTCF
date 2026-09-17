@@ -5,12 +5,9 @@ basis_sets_dir = "./basis-sets"
 
 particle_properties_file = "particle-properties.json"
 
-e_basis_set = "3-21G"
-n_basis_set = "DZSNB"
+mol_name = "H2"
 
-mol_name = "LiH"
-
-truncate_e = 6
+truncate_e = 0
 
 mtx_elmt_threshold = 1e-7
 
@@ -19,6 +16,8 @@ import scipy as sp
 import torch
 import json
 import itertools
+import argparse
+import time
 
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.linalg import block_diag
@@ -34,14 +33,34 @@ from gbasis.integrals.overlap import overlap_integral
 from gbasis.integrals.kinetic_energy import kinetic_energy_integral
 from gbasis.integrals.electron_repulsion import electron_repulsion_integral
 
+parser = argparse.ArgumentParser(
+               prog='NEOFCI',
+               description='Nuclear electronic orbitals full configuration interaction calculation',
+               epilog='Written by Allie')
+parser.add_argument('mol_xyz')
+parser.add_argument('e_basis_set')
+parser.add_argument('n_basis_set')
+
+args = parser.parse_args()
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("Using GPU")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")  # For Apple Silicon
+else:
+    device = torch.device("cpu")
+    print("Using CPU")
+
+
 # Load properties of all possible particles (spin, fermion/boson, mass, charge, etc)
 with open(particle_properties_file, "r") as file:
     particle_properties = json.load(file)
 
 # Build molecule for PySCF
 mol = gto.Mole()
-mol.atom = mol_dir + '/' + mol_name + '.xyz'
-mol.basis = e_basis_set
+mol.atom = args.mol_xyz
+mol.basis = args.e_basis_set
 mol.build()
 
 mol_zs = mol.atom_charges()
@@ -52,7 +71,7 @@ mol_coords = mol.atom_coords()
 hf = scf.RHF(mol).run() # TODO: apparently there might be better choices of orbital to allow for truncations (FNO). look into?
 
 # Load basis dictionary (atomic orbitals) for nuclear orbitals
-n_basis_dict = parse_nwchem(basis_sets_dir + '/nuclear/' + n_basis_set + '.nw')
+n_basis_dict = parse_nwchem(basis_sets_dir + '/nuclear/' + args.n_basis_set + '.nw')
 
 # Construct a dictionary of all the particle types that will be in our calculation, along with their orbitals and info like spin.
 # Note: we will use the order of the dictionary. Python 3.7+ guarantees when we iterate, the dictionary will be ordered according to when the elements were added.
@@ -241,9 +260,8 @@ def get_diff_states(particle, state_idx, d):
 
     return new_states
 
-# We will construct the Hamiltonian matrix in this basis, one interaction at a time
-
-t_mtx = csr_matrix((total_states,total_states)) # Create empty sparse matrix of the appropriate size for the KE operator
+print('[ ] Constructing kinetic energy mtx elements...', end='\r')
+start_ke = time.perf_counter()
 
 t1s = []
 
@@ -293,6 +311,13 @@ for symb in particles:
 
     t1s.append((particle, torch.sparse_coo_tensor([t1_rows, t1_cols], t1_values, size=(no_states, no_states), dtype=torch.double)))
 
+
+start_pe_like = time.perf_counter()
+time_ke = start_pe_like - start_ke
+
+print(f"[X] Kinetic energy mtx elements constructed in {time_ke:.1f}s")
+print('[ ] Constructing potential energy mtx elements between like particles...', end='\r')
+
 v1s = []
 
 # Two-body interactions between particles of the SAME type. TODO: implement boson interactions with their different exchange behavior
@@ -315,7 +340,6 @@ for symb in particles:
 
     # For all N-particle bras, use Slater-Condon rules to calculate matrix elements
     for bra_idx in range(no_states):
-        print(bra_idx)
         # Matrix elements for states that differ by 0 one-particle states
         for ket_idx, common, deoccupy, occupy, parity in get_diff_states(particle, bra_idx, 0):
             elmt = sum([cmb_int_spin[i,i,j,j]-cmb_int_spin[i,j,j,i] for i, j in itertools.combinations(common, 2)])
@@ -352,6 +376,12 @@ for symb in particles:
 
     v1s.append((particle, torch.sparse_coo_tensor([v1_rows, v1_cols], v1_values, size=(no_states, no_states), dtype=torch.double)))
 
+start_pe_diff = time.perf_counter()
+time_pe_like = start_pe_diff - start_pe_like
+
+print(f"[X] Potential energy mtx elements for like particles constructed in {time_pe_like:.1f}s")
+print('[ ] Constructing potential energy mtx elements between different particles...', end='\r')
+
 v2s = []
 
 # Two-body interactions between particles of the SAME type. TODO: implement boson interactions with their different exchange behavior
@@ -384,7 +414,6 @@ for symb1, symb2 in itertools.combinations(particles, 2):
     # For all N-particle bras, use Slater-Condon rules to calculate matrix elements
     for bra1_idx in range(no_states1):
         for bra2_idx in range(no_states2):
-            print(bra1_idx, bra2_idx)
             # Matrix elements for states that differ by 0 one-particle states for both bras
             for ket1_idx, common1, deoccupy1, occupy1, parity1 in get_diff_states(particle1, bra1_idx, 0):
                 for ket2_idx, common2, deoccupy2, occupy2, parity2 in get_diff_states(particle2, bra2_idx, 0):
@@ -445,48 +474,53 @@ for symb1, symb2 in itertools.combinations(particles, 2):
 
     v2s.append(((particle1, particle2), torch.sparse_coo_tensor([v2_bra1s, v2_ket1s, v2_bra2s, v2_ket2s], v2_values, size=(no_states1, no_states1, no_states2, no_states2), dtype=torch.double)))
 
-    no_statess = tuple([particles[symb]['no_states'] for symb in particles])
+start_diag = time.perf_counter()
+time_pe_diff = start_diag - start_pe_diff
+
+print(f"[X] Potential energy mtx elements for different particles constructed in {time_pe_diff:.1f}s")
+print('[ ] Iterative diagonalization...', end='\r')
+
+no_statess = tuple([particles[symb]['no_states'] for symb in particles])
 
 
-    def matvec(v):
-        print('Called!')
-        vn = torch.tensor(v.reshape(no_statess, order='F'), dtype=torch.double)
-        vr = torch.zeros(no_statess)
+def matvec(v):
+    vn = torch.tensor(v.reshape(no_statess, order='F'), dtype=torch.double).to(device)
+    vr = torch.zeros(no_statess).to(device)
 
-        for particle, mtx in t1s:
-            idx = particle['idx']
+    for particle, mtx in t1s:
+        idx = particle['idx']
 
-            a = torch.tensordot(vn, mtx.to_dense(), dims=([idx], [1]))
-            permute = np.concatenate((np.arange(idx), [particle_types - 1], np.arange(idx, particle_types - 1)))
+        a = torch.tensordot(vn, mtx.to_dense(), dims=([idx], [1]))
+        permute = np.concatenate((np.arange(idx), [particle_types - 1], np.arange(idx, particle_types - 1)))
 
-            a = np.transpose(a, tuple(permute))
+        a = np.transpose(a, tuple(permute))
 
-            vr += a
+        vr += a
 
-        for particle, mtx in v1s:
-            idx = particle['idx']
+    for particle, mtx in v1s:
+        idx = particle['idx']
 
-            a = torch.tensordot(vn, mtx.to_dense(), dims=([idx], [1]))
-            permute = np.concatenate((np.arange(idx), [particle_types - 1], np.arange(idx, particle_types - 1)))
+        a = torch.tensordot(vn, mtx.to_dense(), dims=([idx], [1]))
+        permute = np.concatenate((np.arange(idx), [particle_types - 1], np.arange(idx, particle_types - 1)))
 
-            a = np.transpose(a, tuple(permute))
+        a = np.transpose(a, tuple(permute))
 
-            vr += a
+        vr += a
 
-        for particles, tensor in v2s:
-            idx1 = particles[0]['idx']
-            idx2 = particles[1]['idx']
+    for particles, tensor in v2s:
+        idx1 = particles[0]['idx']
+        idx2 = particles[1]['idx']
 
-            a = torch.tensordot(vn, tensor.to_dense(), dims=([idx1, idx2], [1, 3]))
-            permute = np.arange(particle_types - 2)
-            permute = np.insert(permute, idx1, particle_types - 2)
-            permute = np.insert(permute, idx2, particle_types - 1)
+        a = torch.tensordot(vn, tensor.to_dense(), dims=([idx1, idx2], [1, 3]))
+        permute = np.arange(particle_types - 2)
+        permute = np.insert(permute, idx1, particle_types - 2)
+        permute = np.insert(permute, idx2, particle_types - 1)
 
-            a = torch.permute(a, tuple(permute))
+        a = torch.permute(a, tuple(permute))
 
-            vr += a
+        vr += a
 
-        return vr.numpy().reshape(total_states, order='F')
+    return vr.numpy().reshape(total_states, order='F')
 
 import scipy as sp
 #h_mtx = t_mtx + v_mtx
@@ -496,5 +530,10 @@ from scipy.sparse.linalg import LinearOperator
 A = LinearOperator(shape=(total_states, total_states), matvec=matvec, dtype=float)
 
 a_eigvals, a_eigvecs = sp.sparse.linalg.eigsh(A, k=25, which='SA', tol=1e-6, maxiter=250)
+
+end_diag = time.perf_counter()
+time_diag = end_diag - start_diag
+
+print(f"[X] Iterative diagonalization completed in {time_diag:.1f}s")
 
 print(a_eigvals)
