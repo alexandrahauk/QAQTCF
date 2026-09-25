@@ -536,4 +536,5 @@ time_diag = end_diag - start_diag
 
 print(f"[X] Iterative diagonalization completed in {time_diag:.1f}s")
 
-print(a_eigvals)
+np.savetxt('eigvals.dat', a_eigvals, delimiter=',', fmt='%f')
+np.savetxt('eigvecs.dat', a_eigvecs, delimiter=',', fmt='%f')
