@@ -1,6 +1,11 @@
+from scipy.constants import electron_mass
+
+mol_dir = "./mols"
 basis_sets_dir = "./basis-sets"
 
 particle_properties_file = "particle-properties.json"
+
+mol_name = "H2"
 
 truncate_e = 0
 
@@ -33,7 +38,6 @@ parser = argparse.ArgumentParser(
                description='Nuclear electronic orbitals full configuration interaction calculation',
                epilog='Written by Allie')
 parser.add_argument('mol_xyz')
-parser.add_argument('spin_file')
 parser.add_argument('e_basis_set')
 parser.add_argument('n_basis_set')
 
@@ -127,16 +131,6 @@ for symb in particles:
     # Number of spin orbitals, since we now have the particle's spin
     particles[symb]['no_spin_orbitals'] = particles[symb]['no_spatial_orbitals'] * particles[symb]['properties']['spin']
 
-# Read in file containing the count of particles in each spin state (alpha, beta, etc) for each particle
-with open(args.spin_file, 'r', encoding='utf-8') as file:
-    while True:
-        line = file.readline()
-        if not line:
-            break  # End of file reached
-
-        split = line.strip().split()
-        particles[split[0]]['occs'] = [int(s) for s in split[1:]]
-
 # Amount of particles we have
 particle_types = len(particles)
 
@@ -187,6 +181,9 @@ class IntegralSpinWrapper:
 # Total number of states in this space
 total_states = 1
 
+# Number of permanents/determinants for each particle.
+no_states = []
+
 # For the Hamiltonian matrix, we will index the states as follows:
 # Let N_i be the number of states for the i-th particle
 # The state formed from the c_0 - th particle 1 permanent/determinant, c_1 - th particle 2 perminant/determinant, etc (c_i's zero indexed)
@@ -198,42 +195,26 @@ bases = []
 
 # Construct N-particle states
 for symb in particles:
-    particle = particles[symb]
-    particle['states'] = []
-    particle['bases'] = []
-
-    no_states = 1
+    particles[symb]['states'] = []
 
     # Construct all N-particle states for the correct N, in the forms of arrays of 1s and 0s. They will be indexed in the order we get them from itertools
     # States with the same spatial wave function will be grouped together. For example, for 4 spatial orbitals with A and B spin states, the significance of the bits will be
     # Bit number:       12345678
     # Spin:             ABABABAB
     # Spatial orbital:  11223344
-    for spin in range(particle['properties']['spin']):
-        states = [] # States for this particular particle ("strings" in Handy-Knowles paper)
+    for indices in itertools.combinations(range(particles[symb]['no_spin_orbitals']), particles[symb]['count']):
+        array = [0] * particles[symb]['no_spin_orbitals']
+        for index in indices:
+            array[index] = 1
 
-        occ = particle['occs'][spin] # Number of this particle with this spin
-        for indices in itertools.combinations(range(particle['no_spatial_orbitals']), occ):
-            array = [0] * particle['no_spatial_orbitals']
-            for index in indices:
-                array[index] = 1
+        particles[symb]['states'].append(array)
 
-            states.append(array)
+    particles[symb]['no_states'] = len(particles[symb]['states'])
+    particles[symb]['base'] = total_states
 
-        particle['states'].append(states)
-        particle['bases'].append(no_states)
-
-        no_states *= len(states)
-        total_states *= len(states)
-
-    particle['no_states'] = len(particle['states'])
-    particle['base'] = total_states
-
-    bases.append(particle['base'])
-    total_states *= particle['no_states']
-
-
-
+    no_states.append(particles[symb]['no_states'])
+    bases.append(particles[symb]['base'])
+    total_states *= particles[symb]['no_states']
 
 bases.append(total_states) # Having this extra element will be helpful in construct_1_particle_interaction
 
