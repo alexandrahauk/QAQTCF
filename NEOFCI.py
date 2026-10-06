@@ -18,6 +18,7 @@ from scipy.linalg import block_diag
 
 from pyscf import gto, scf
 from pyscf.lo import orth
+from pyscf.lib.linalg_helper import davidson
 
 from gbasis.wrappers import from_pyscf
 from gbasis.parsers import parse_nwchem
@@ -235,6 +236,8 @@ full_cmb_int = electron_repulsion_integral(full_basis, notation='chemist', trans
 
 print("2e ints formed")
 
+int_time = time.perf_counter()
+
 particles['e']['no_spatial_orbitals'] -= args.truncate
 
 # Construct N-particle states
@@ -287,6 +290,9 @@ for symb1 in particles:
 
         full_cmb_int[fbi1:fbi1+obtl1, fbi1:fbi1+obtl1, fbi2:fbi2+obtl2, fbi2:fbi2+obtl2] *= charge1 * charge2 * half
 
+
+
+
 # Construct single replacements
 for symb in particles:
     particle = particles[symb]
@@ -297,7 +303,76 @@ for symb in particles:
         states_r = [get_diff_states(state, particle['addr_arrays'][spin]) for state in particle['states'][spin]]
         particle['states_r'].append(states_r)
 
-int_time = time.perf_counter()
+# Construct diagonal elements of Hamiltonian using Slater-Condon rules
+H_diag = np.zeros(tuple(string_mtx_shape))
+
+for symb in particles:
+    particle = particles[symb]
+
+    tensor_idx = particle['tensor_idx']
+
+    mass = particle['properties']['mass']
+    spin = particle['properties']['spin']
+
+    fbi = particle['full_basis_idx']
+    obtl = particle['no_spatial_orbitals']
+
+    ke_int = kinetic_energy_integral(particle['basis'], transform=particle['transform']) / mass
+    cmb_int = full_cmb_int[fbi:fbi + obtl, fbi:fbi + obtl, fbi:fbi + obtl, fbi:fbi + obtl]
+
+    for s in range(spin):
+        idx_lhs = [slice(None)] * H_diag.ndim
+        for state_no, state in enumerate(particle['states'][s]):
+            idx_lhs[tensor_idx + s] = state_no
+            idxt_lhs = tuple(idx_lhs)
+
+            H_diag[idxt_lhs] += sum([ke_int[o, o] for o in state]) + 2*sum([cmb_int[o1, o1, o2, o2] - cmb_int[o1, o2, o2, o1] for o1, o2 in itertools.combinations(state, 2)])
+
+    for s1 in range(spin):
+        for s2 in range(s1):
+            idx_lhs = [slice(None)] * H_diag.ndim
+            for state1_no, state1 in enumerate(particle['states'][s1]):
+                for state2_no, state2 in enumerate(particle['states'][s2]):
+                    idx_lhs[tensor_idx + s1] = state1_no
+                    idx_lhs[tensor_idx + s2] = state2_no
+
+                    idxt_lhs = tuple(idx_lhs)
+                    H_diag[idxt_lhs] += 2*sum([cmb_int[o1, o1, o2, o2] for o1, o2 in itertools.product(state1, state2)])
+
+for symb1, symb2 in itertools.combinations(particles, 2):
+    particle1 = particles[symb1]
+    particle2 = particles[symb2]
+
+    fbi1 = particle1['full_basis_idx']
+    obtl1 = particle1['no_spatial_orbitals']
+
+    fbi2 = particle2['full_basis_idx']
+    obtl2 = particle2['no_spatial_orbitals']
+
+    tensor_idx1 = particle1['tensor_idx']
+    tensor_idx2 = particle2['tensor_idx']
+
+    spin1 = particle1['properties']['spin']
+    spin2 = particle2['properties']['spin']
+
+    cmb_int = full_cmb_int[fbi1:fbi1 + obtl1, fbi1:fbi1 + obtl1, fbi2:fbi2 + obtl2, fbi2:fbi2 + obtl2]
+
+    for s1 in range(spin1):
+        for s2 in range(spin2):
+            idx_lhs = [slice(None)] * H_diag.ndim
+            for state1_no, state1 in enumerate(particle1['states'][s1]):
+                for state2_no, state2 in enumerate(particle2['states'][s2]):
+                    idx_lhs[tensor_idx1 + s1] = state1_no
+                    idx_lhs[tensor_idx2 + s2] = state2_no
+
+                    idxt_lhs = tuple(idx_lhs)
+
+                    H_diag[idxt_lhs] += sum([cmb_int[o1, o1, o2, o2] for o1, o2 in itertools.product(state1, state2)])
+
+H_diag = H_diag.reshape(total_states, order='F')
+
+diag_elmts_time = time.perf_counter()
+print(f"Diagonal elements of H constructed in in {diag_elmts_time-int_time:.1f}s")
 
 def matvec(v):
     C = v.reshape(string_mtx_shape, order='F')
@@ -305,6 +380,7 @@ def matvec(v):
         C = cp.asarray(C)
 
     sigma = cp.zeros(string_mtx_shape)
+    sigma2 = cp.zeros(string_mtx_shape)
 
     for symb in particles:
         particle = particles[symb]
@@ -314,7 +390,6 @@ def matvec(v):
         mass = particle['properties']['mass']
         spin = particle['properties']['spin']
 
-        fbi = particle['full_basis_idx']
         obtl = particle['no_spatial_orbitals']
 
         ke_int = kinetic_energy_integral(particle['basis'], transform=particle['transform']) / mass
@@ -455,13 +530,17 @@ def matvec(v):
 
     return sigma
 
-H = LinearOperator(shape=(total_states, total_states), matvec=matvec, dtype=float)
+#H = LinearOperator(shape=(total_states, total_states), matvec=matvec, dtype=float)
+#h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=args.eigs, which='SA', tol=1e-10, maxiter=250)
 
-h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=args.eigs, which='SA', tol=1e-10, maxiter=250)
+x0 = np.zeros(total_states)
+x0[0] = 1
+
+h_eigvals, h_eigvecs = davidson(matvec, x0, H_diag, nroots=args.eigs)
 
 diag_time = time.perf_counter()
 
-print(f"Iterative diagonalization completed in {diag_time-int_time:.1f}s")
+print(f"Iterative diagonalization completed in {diag_time-diag_elmts_time:.1f}s")
 
 print(h_eigvals)
 
