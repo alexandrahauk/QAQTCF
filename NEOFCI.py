@@ -40,7 +40,7 @@ parser.add_argument('spin_file')
 parser.add_argument('e_basis_set')
 parser.add_argument('n_basis_set')
 
-parser.add_argument('-t', '--truncate', help='Number of electronic SCF orbitals to truncate') # truncate
+parser.add_argument('-t', '--truncate', help='Number of electronic SCF orbitals to truncate', type=int) # truncate
 parser.add_argument('-g', '--gpu', help='Use GPU acceleration with cupy', action='store_true') # truncate
 
 args = parser.parse_args()
@@ -117,7 +117,7 @@ particles['e'] = {}
 particles['e']['basis'] = from_pyscf(mol) # Gbasis set of GTOs (gaussian type orbitals) for electronic particles
 particles['e']['transform'] = hf.mo_coeff.T # transform to MOs that will be used for calculation
 particles['e']['count'] = mol.nelectron  # Get number of electrons from PySCF, truncate off 10
-particles['e']['no_spatial_orbitals'] = hf.mo_coeff.shape[0] - args.truncate
+particles['e']['no_spatial_orbitals'] = hf.mo_coeff.shape[0]
 
 idx = 0
 
@@ -155,7 +155,7 @@ particle_names = [symb for symb in particles]
 # Total number of states in this space
 total_states = 1
 
-# Given a certain N-particle state index, construct an array of the indices of all states differing by d1one-particle states, combined with info on which states are different and what the parity factor is after aligning up all the common states
+# Get states with non-zero coupling constant gamma^IJ_ij = <I|gamma_ij|J> = <I|a^\dag_i a_j|J>
 # gamma^IJ_ij = parity
 # i = occupy, j = deocccupy
 # J = input state, I = output state
@@ -224,6 +224,19 @@ string_mtx_shape = []
 tensor_idx = 0
 full_basis_idx = 0
 
+# Combine bases of all the particles (the overlaps between different particles will be nonsensical)
+full_basis = tuple(itertools.chain.from_iterable([particles[symb]['basis'] for symb in particles]))
+
+# Full orthonormalization transform for this basis
+full_transform = block_diag(*tuple([particles[symb]['transform'] for symb in particles]))
+
+# All coulomb integrals contained in this
+full_cmb_int = electron_repulsion_integral(full_basis, notation='chemist', transform=full_transform)
+
+print("2e ints formed")
+
+particles['e']['no_spatial_orbitals'] -= args.truncate
+
 # Construct N-particle states
 for symb in particles:
     particle = particles[symb]
@@ -233,22 +246,12 @@ for symb in particles:
 
     no_states = 1
 
-
-    # Construct all N-particle states for the correct N, in the forms of arrays of 1s and 0s. They will be indexed in the order we get them from itertools
-    # States with the same spatial wave function will be grouped together. For example, for 4 spatial orbitals with A and B spin states, the significance of the bits will be
-    # Bit number:       12345678
-    # Spin:             ABABABAB
     # Spatial orbital:  11223344
     for spin in range(particle['properties']['spin']):
         states = [] # States for this particular particle ("strings" in Handy-Knowles paper)
 
         occ = particle['occs'][spin] # Number of this particle with this spin
         for indices in itertools.combinations(range(particle['no_spatial_orbitals']), occ):
-            #array = [0] * particle['no_spatial_orbitals']
-            #for index in indices:
-            #    array[index] = 1
-
-            #states.append(array)
             states.append(list(indices))
 
         particle['states'].append(states)
@@ -267,25 +270,6 @@ for symb in particles:
     tensor_idx += particle['properties']['spin']
     full_basis_idx += particle['no_spatial_orbitals']
 
-# Construct single replacements
-for symb in particles:
-    particle = particles[symb]
-
-    particle['states_r'] = []
-
-    for spin in range(particle['properties']['spin']):
-        states_r = [get_diff_states(state, particle['addr_arrays'][spin]) for state in particle['states'][spin]]
-        particle['states_r'].append(states_r)
-
-# Combine bases of all the particles (the overlaps between different particles will be nonsensical)
-full_basis = tuple(itertools.chain.from_iterable([particles[symb]['basis'] for symb in particles]))
-
-# Full orthonormalization transform for this basis
-full_transform = block_diag(*tuple([particles[symb]['transform'] for symb in particles]))
-
-# All coulomb integrals contained in this
-full_cmb_int = electron_repulsion_integral(full_basis, notation='chemist', transform=full_transform)
-
 # Now we will multiple these two-electron integrals by the factors coming from the charge and particle statistics
 for symb1 in particles:
     particle1 = particles[symb1]
@@ -303,7 +287,15 @@ for symb1 in particles:
 
         full_cmb_int[fbi1:fbi1+obtl1, fbi1:fbi1+obtl1, fbi2:fbi2+obtl2, fbi2:fbi2+obtl2] *= charge1 * charge2 * half
 
-print("2e ints formed")
+# Construct single replacements
+for symb in particles:
+    particle = particles[symb]
+
+    particle['states_r'] = []
+
+    for spin in range(particle['properties']['spin']):
+        states_r = [get_diff_states(state, particle['addr_arrays'][spin]) for state in particle['states'][spin]]
+        particle['states_r'].append(states_r)
 
 int_time = time.perf_counter()
 
@@ -345,11 +337,9 @@ def matvec(v):
 
                     idx_rhs[tensor_idx + s] = state_r_no
 
-                    idx_lhs[-2] = i
-                    idx_lhs[-1] = j
+                    idx_lhs[-2], idx_lhs[-1] = i, j
 
-                    idxt_lhs = tuple(idx_lhs)
-                    idxt_rhs = tuple(idx_rhs)
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     D[idxt_lhs] += C[idxt_rhs] * parity
 
@@ -366,11 +356,9 @@ def matvec(v):
 
                     idx_lhs[tensor_idx + s] = state_r_no
 
-                    idx_rhs[-2] = i
-                    idx_rhs[-1] = j
+                    idx_rhs[-2], idx_rhs[-1] = i, j
 
-                    idxt_lhs = tuple(idx_lhs)
-                    idxt_rhs = tuple(idx_rhs)
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     sigma[idxt_lhs] += E[idxt_rhs] * parity
 
@@ -385,8 +373,7 @@ def matvec(v):
 
                     elmt = sum(full_cmb_int[i+fbi, j+fbi, j+fbi, l+fbi] for j in range(obtl))
 
-                    idxt_lhs = tuple(idx_lhs)
-                    idxt_rhs = tuple(idx_rhs)
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     sigma[idxt_lhs] -= elmt * parity * C[idxt_rhs]
 
@@ -400,8 +387,7 @@ def matvec(v):
                 for state_r_no, i, j, parity in states_r:
                     idx_lhs[tensor_idx + s] = state_r_no # I
 
-                    idxt_lhs = tuple(idx_lhs)
-                    idxt_rhs = tuple(idx_rhs)
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     sigma[idxt_lhs] += parity * C[idxt_rhs] * ke_int[i, j]
 
@@ -439,11 +425,9 @@ def matvec(v):
                 for state_r_no, a, b, parity in states_r:
                     idx_rhs[tensor_idx2 + s2] = state_r_no
 
-                    idx_lhs[-2] = a
-                    idx_lhs[-1] = b
+                    idx_lhs[-2], idx_lhs[-1] = a, b
 
-                    idxt_lhs = tuple(idx_lhs)
-                    idxt_rhs = tuple(idx_rhs)
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     D[idxt_lhs] += C[idxt_rhs] * parity
 
@@ -458,11 +442,9 @@ def matvec(v):
                 for state_r_no, i, j, parity in states_r:
                     idx_lhs[tensor_idx1 + s1] = state_r_no
 
-                    idx_rhs[-2] = i
-                    idx_rhs[-1] = j
+                    idx_rhs[-2], idx_rhs[-1] = i, j
 
-                    idxt_lhs = tuple(idx_lhs)
-                    idxt_rhs = tuple(idx_rhs)
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     sigma[idxt_lhs] += E[idxt_rhs] * parity
 
