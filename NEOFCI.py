@@ -4,8 +4,6 @@ particle_properties_file = "particle-properties.json"
 
 truncate_e = 0
 
-mtx_elmt_threshold = 1e-7
-
 mol_xyz = 'mols/H22.xyz'
 spin_file = 'H2.spin'
 
@@ -19,7 +17,6 @@ import argparse
 import time
 import math
 
-from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import LinearOperator
 from scipy.linalg import block_diag
 
@@ -43,8 +40,18 @@ parser.add_argument('spin_file')
 parser.add_argument('e_basis_set')
 parser.add_argument('n_basis_set')
 
+parser.add_argument('-t', '--truncate', help='Number of electronic SCF orbitals to truncate') # truncate
+parser.add_argument('-g', '--gpu', help='Use GPU acceleration with cupy', action='store_true') # truncate
 
 args = parser.parse_args()
+
+if args.truncate is None:
+    args.truncate = 0
+
+if args.gpu:
+    import cupy as cp
+else:
+    cp = np
 
 # Load properties of all possible particles (spin, fermion/boson, mass, charge, etc)
 with open(particle_properties_file, "r") as file:
@@ -110,7 +117,7 @@ particles['e'] = {}
 particles['e']['basis'] = from_pyscf(mol) # Gbasis set of GTOs (gaussian type orbitals) for electronic particles
 particles['e']['transform'] = hf.mo_coeff.T # transform to MOs that will be used for calculation
 particles['e']['count'] = mol.nelectron  # Get number of electrons from PySCF, truncate off 10
-particles['e']['no_spatial_orbitals'] = hf.mo_coeff.shape[0] - truncate_e
+particles['e']['no_spatial_orbitals'] = hf.mo_coeff.shape[0] - args.truncate
 
 idx = 0
 
@@ -147,8 +154,6 @@ particle_names = [symb for symb in particles]
 
 # Total number of states in this space
 total_states = 1
-
-
 
 # Given a certain N-particle state index, construct an array of the indices of all states differing by d1one-particle states, combined with info on which states are different and what the parity factor is after aligning up all the common states
 # gamma^IJ_ij = parity
@@ -193,9 +198,6 @@ def get_diff_states(occupied, addr_array):
 
     return new_states
 
-
-import math
-
 def create_addr_array(M, N):
     if N == 0:
         return np.array([[]])
@@ -231,6 +233,12 @@ for symb in particles:
 
     no_states = 1
 
+
+    # Construct all N-particle states for the correct N, in the forms of arrays of 1s and 0s. They will be indexed in the order we get them from itertools
+    # States with the same spatial wave function will be grouped together. For example, for 4 spatial orbitals with A and B spin states, the significance of the bits will be
+    # Bit number:       12345678
+    # Spin:             ABABABAB
+    # Spatial orbital:  11223344
     for spin in range(particle['properties']['spin']):
         states = [] # States for this particular particle ("strings" in Handy-Knowles paper)
 
@@ -258,7 +266,6 @@ for symb in particles:
 
     tensor_idx += particle['properties']['spin']
     full_basis_idx += particle['no_spatial_orbitals']
-
 
 # Construct single replacements
 for symb in particles:
@@ -300,12 +307,12 @@ print("2e ints formed")
 
 int_time = time.perf_counter()
 
-
 def matvec(v):
     C = v.reshape(string_mtx_shape, order='F')
+    if args.gpu: # gpu acceleration
+        C = cp.asarray(C)
 
-    sigma = np.zeros(string_mtx_shape)
-    sigma2 = np.zeros(string_mtx_shape)
+    sigma = cp.zeros(string_mtx_shape)
 
     for symb in particles:
         particle = particles[symb]
@@ -315,14 +322,17 @@ def matvec(v):
         mass = particle['properties']['mass']
         spin = particle['properties']['spin']
 
-
         fbi = particle['full_basis_idx']
         obtl = particle['no_spatial_orbitals']
 
         ke_int = kinetic_energy_integral(particle['basis'], transform=particle['transform']) / mass
         cmb_int = full_cmb_int[fbi:fbi+obtl, fbi:fbi+obtl, fbi:fbi+obtl, fbi:fbi+obtl]
 
-        D = np.zeros(tuple(string_mtx_shape) + (particle['no_spatial_orbitals'], particle['no_spatial_orbitals']))
+        if args.gpu:
+            ke_int = cp.asarray(ke_int)
+            cmb_int = cp.asarray(cmb_int)
+
+        D = cp.zeros(tuple(string_mtx_shape) + (particle['no_spatial_orbitals'], particle['no_spatial_orbitals']))
 
         # Coulomb interaction between like particles only
         for s in range(spin):
@@ -344,7 +354,7 @@ def matvec(v):
                     D[idxt_lhs] += C[idxt_rhs] * parity
 
 
-        E = np.tensordot(D, cmb_int, axes=([-2, -1], [-2, -1]))
+        E = cp.tensordot(D, cmb_int, axes=([-2, -1], [-2, -1]))
 
         for s in range(spin):
             idx_lhs = [slice(None)] * sigma.ndim
@@ -414,8 +424,11 @@ def matvec(v):
 
         cmb_int = full_cmb_int[fbi1:fbi1+obtl1, fbi1:fbi1+obtl1, fbi2:fbi2+obtl2, fbi2:fbi2+obtl2]
 
-        D = np.zeros(tuple(string_mtx_shape) + (obtl2, obtl2))
-        E = np.zeros(tuple(string_mtx_shape) + (obtl1, obtl1))
+        if args.gpu:
+            cmb_int = cp.asarray(cmb_int)
+
+        D = cp.zeros(tuple(string_mtx_shape) + (obtl2, obtl2))
+        E = cp.zeros(tuple(string_mtx_shape) + (obtl1, obtl1))
 
         for s2 in range(spin2):
             idx_lhs = [slice(None)] * D.ndim
@@ -434,7 +447,7 @@ def matvec(v):
 
                     D[idxt_lhs] += C[idxt_rhs] * parity
 
-        E = np.tensordot(D, cmb_int, axes=([-2, -1], [-2, -1]))
+        E = cp.tensordot(D, cmb_int, axes=([-2, -1], [-2, -1]))
 
         for s1 in range(spin1):
             idx_lhs = [slice(None)] * sigma.ndim
@@ -453,11 +466,16 @@ def matvec(v):
 
                     sigma[idxt_lhs] += E[idxt_rhs] * parity
 
-    return(sigma.reshape(total_states, order='F'))
+    if args.gpu:
+        sigma = cp.asnumpy(sigma)
+
+    sigma = sigma.reshape(total_states, order='F')
+
+    return sigma
 
 H = LinearOperator(shape=(total_states, total_states), matvec=matvec, dtype=float)
 
-h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=num_eigvals, which='SA', tol=1e-8, maxiter=250)
+h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=num_eigvals, which='SA', tol=1e-10, maxiter=250)
 
 diag_time = time.perf_counter()
 
