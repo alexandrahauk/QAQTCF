@@ -2,12 +2,8 @@ basis_sets_dir = "./basis-sets"
 
 particle_properties_file = "particle-properties.json"
 
-truncate_e = 0
-
 mol_xyz = 'mols/H22.xyz'
 spin_file = 'H2.spin'
-
-num_eigvals = 20
 
 import numpy as np
 import scipy as sp
@@ -42,11 +38,15 @@ parser.add_argument('n_basis_set')
 
 parser.add_argument('-t', '--truncate', help='Number of electronic SCF orbitals to truncate', type=int) # truncate
 parser.add_argument('-g', '--gpu', help='Use GPU acceleration with cupy', action='store_true') # truncate
+parser.add_argument('-e', '--eigs', help='Number of eigenvectors/values to calculate during iterative procedure')
 
 args = parser.parse_args()
 
 if args.truncate is None:
     args.truncate = 0
+
+if args.eigs is None:
+    args.eigs = 10 # 10 lowest states by default
 
 if args.gpu:
     import cupy as cp
@@ -457,7 +457,7 @@ def matvec(v):
 
 H = LinearOperator(shape=(total_states, total_states), matvec=matvec, dtype=float)
 
-h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=num_eigvals, which='SA', tol=1e-10, maxiter=250)
+h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=args.eigs, which='SA', tol=1e-10, maxiter=250)
 
 diag_time = time.perf_counter()
 
