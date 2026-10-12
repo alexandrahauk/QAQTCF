@@ -41,6 +41,7 @@ parser.add_argument('-t', '--truncate', help='Number of electronic SCF orbitals 
 parser.add_argument('-g', '--gpu', help='Use GPU acceleration with cupy', action='store_true') # truncate
 parser.add_argument('-e', '--eigs', help='Number of eigenvectors/values to calculate during iterative procedure', type=int)
 parser.add_argument('-n', '--nucmol')
+parser.add_argument('-m', '--mem', help='Approximate amount of memory to use (should choose a number lower than available amount since it will definitely go over', type=int)
 
 args = parser.parse_args()
 
@@ -49,6 +50,9 @@ if args.truncate is None:
 
 if args.eigs is None:
     args.eigs = 10 # 10 lowest states by default
+
+if args.mem is None:
+    args.mem = 4000 # default to 4GB
 
 if args.gpu:
     import cupy as cp
@@ -313,14 +317,29 @@ for symb in particles:
     particle = particles[symb]
     particle['ke_int'] = kinetic_energy_integral(particle['basis'], transform=particle['transform']) / particle['properties']['mass']
 
+state_mem = math.prod(string_mtx_shape) * 8/1000000.0 # Number of memory required to store a single state in MB
+
+ij_blocksize = int(math.sqrt(args.mem / (state_mem * 2)))
+
 # Construct single replacements
 for symb in particles:
     particle = particles[symb]
 
     particle['states_r'] = []
 
+    blocks = int(particle['no_spatial_orbitals'] / ij_blocksize) + 1
+    particle['blocks'] = blocks
+
     for spin in range(particle['properties']['spin']):
-        states_r = [get_diff_states(state, particle['addr_arrays'][spin]) for state in particle['states'][spin]]
+        states_r = [[[] for i_block in range(blocks)] for j_block in range(blocks)]
+
+        for state_no, state in enumerate(particle['states'][spin]):
+            for state_r_no, i, j, parity in get_diff_states(state, particle['addr_arrays'][spin]):
+                i_block = int(i / ij_blocksize)
+                j_block = int(j / ij_blocksize)
+
+                states_r[i_block][j_block].append((state_no, state_r_no, i, j, parity))
+
         particle['states_r'].append(states_r)
 
 # Construct diagonal elements of Hamiltonian using Slater-Condon rules
@@ -394,6 +413,9 @@ H_diag = H_diag.reshape(total_states, order='F')
 diag_elmts_time = time.perf_counter()
 print(f"Diagonal elements of H constructed in in {diag_elmts_time-int_time:.1f}s")
 
+print("Memory per state vector", state_mem)
+print("Block size", ij_blocksize)
+
 def matvec(v):
     C = v.reshape(string_mtx_shape, order='F')
     if args.gpu: # gpu acceleration
@@ -408,6 +430,7 @@ def matvec(v):
 
         mass = particle['properties']['mass']
         spin = particle['properties']['spin']
+        blocks = particle['blocks']
 
         obtl = particle['no_spatial_orbitals']
         cmb_int = full_cmb_int[fbi:fbi+obtl, fbi:fbi+obtl, fbi:fbi+obtl, fbi:fbi+obtl]
@@ -417,72 +440,107 @@ def matvec(v):
             ke_int = cp.asarray(ke_int)
             cmb_int = cp.asarray(cmb_int)
 
-        D = cp.zeros(tuple(string_mtx_shape) + (particle['no_spatial_orbitals'], particle['no_spatial_orbitals']))
+        for i_block, j_block in np.ndindex((blocks, blocks)):
+            i_offset = i_block * ij_blocksize
+            j_offset = j_block * ij_blocksize
 
-        # Coulomb interaction between like particles only
-        for s in range(spin):
-            idx_lhs = [slice(None)] * D.ndim
-            idx_rhs = [slice(None)] * C.ndim
+            i_end = i_offset + ij_blocksize
+            j_end = j_offset + ij_blocksize
 
-            for state_no, (state, states_r) in enumerate(zip(particle['states'][s], particle['states_r'][s])):
-                idx_lhs[tensor_idx + s] = state_no
-                for state_r_no, i, j, parity in states_r:
+            if i_end > obtl: # if edge blokc
+                i_len = obtl - i_offset
+                i_end = obtl
+            else:
+                i_len = ij_blocksize
 
-                    idx_rhs[tensor_idx + s] = state_r_no
+            if j_end > obtl:
+                j_len = obtl - j_offset
+                j_end = obtl
+            else:
+                j_len = ij_blocksize
 
-                    idx_lhs[-2], idx_lhs[-1] = i, j
+            D = cp.zeros(tuple(string_mtx_shape) + (i_len, j_len))
 
-                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
+            # Kinetic energy
+            for s in range(spin):
+                idx_lhs = [slice(None)] * sigma.ndim
+                idx_rhs = [slice(None)] * C.ndim
 
-                    D[idxt_lhs] += C[idxt_rhs] * parity
-
-
-        E = cp.tensordot(D, cmb_int, axes=([-2, -1], [-2, -1]))
-
-        for s in range(spin):
-            idx_lhs = [slice(None)] * sigma.ndim
-            idx_rhs = [slice(None)] * E.ndim
-
-            for state_no, (state, states_r) in enumerate(zip(particle['states'][s], particle['states_r'][s])):
-                idx_rhs[tensor_idx + s] = state_no
-                for state_r_no, i, j, parity in states_r:
-
-                    idx_lhs[tensor_idx + s] = state_r_no
-
-                    idx_rhs[-2], idx_rhs[-1] = i, j
-
-                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
-
-                    sigma[idxt_lhs] += E[idxt_rhs] * parity
-
-        for s in range(spin):
-            idx_lhs = [slice(None)] * sigma.ndim
-            idx_rhs = [slice(None)] * C.ndim
-
-            for state_no, (state, states_r) in enumerate(zip(particle['states'][s], particle['states_r'][s])):
-                idx_rhs[tensor_idx + s] = state_no  # state_no is J
-                for state_r_no, i, l, parity in states_r:
-                    idx_lhs[tensor_idx + s] = state_r_no # state_r_no is I
-
-                    elmt = sum(full_cmb_int[i+fbi, j+fbi, j+fbi, l+fbi] for j in range(obtl))
-
-                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
-
-                    sigma[idxt_lhs] -= elmt * parity * C[idxt_rhs]
-
-        # Kinetic energy
-        for s in range(spin):
-            idx_lhs = [slice(None)] * sigma.ndim
-            idx_rhs = [slice(None)] * C.ndim
-
-            for state_no, (state, states_r) in enumerate(zip(particle['states'][s], particle['states_r'][s])):
-                idx_rhs[tensor_idx + s] = state_no  # J
-                for state_r_no, i, j, parity in states_r:
-                    idx_lhs[tensor_idx + s] = state_r_no # I
+                for state_no, state_r_no, i, j, parity in particle['states_r'][s][i_block][j_block]:
+                    idx_rhs[tensor_idx + s] = state_no  # J
+                    idx_lhs[tensor_idx + s] = state_r_no  # I
 
                     idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     sigma[idxt_lhs] += parity * C[idxt_rhs] * ke_int[i, j]
+
+            # Exchange interaction
+            for s in range(spin):
+                idx_lhs = [slice(None)] * sigma.ndim
+                idx_rhs = [slice(None)] * C.ndim
+
+                for state_no, state_r_no, i, l, parity in particle['states_r'][s][i_block][j_block]:
+                    idx_rhs[tensor_idx + s] = state_no  # state_no is J
+                    idx_lhs[tensor_idx + s] = state_r_no  # state_r_no is I
+
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
+
+                    elmt = sum(full_cmb_int[i + fbi, j + fbi, j + fbi, l + fbi] for j in range(obtl))
+
+                    sigma[idxt_lhs] -= elmt * parity * C[idxt_rhs]
+
+            # Coulomb interaction between like particles only
+            for s in range(spin):
+                idx_lhs = [slice(None)] * D.ndim
+                idx_rhs = [slice(None)] * C.ndim
+
+                for state_no, state_r_no, i, j, parity in particle['states_r'][s][i_block][j_block]:
+                    idx_lhs[tensor_idx + s] = state_no
+                    idx_rhs[tensor_idx + s] = state_r_no
+
+                    idx_lhs[-2], idx_lhs[-1] = i - i_offset, j - j_offset
+
+                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
+                    D[idxt_lhs] += C[idxt_rhs] * parity
+
+            for k_block, l_block in np.ndindex((blocks, blocks)):
+                k_offset = k_block * ij_blocksize
+                l_offset = l_block * ij_blocksize
+
+                k_end = k_offset + ij_blocksize
+                l_end = l_offset + ij_blocksize
+
+                if k_end > obtl:  # if edge blokc
+                    k_len = obtl - k_offset
+                    k_end = obtl
+                else:
+                    k_len = ij_blocksize
+
+                if l_end > obtl:
+                    l_len = obtl - l_offset
+                    l_end = obtl
+                else:
+                    l_len = ij_blocksize
+
+                E = cp.tensordot(D, cmb_int[i_offset:i_end, j_offset:j_end, k_offset:k_end, l_offset:l_end], axes=([-2, -1], [0, 1]))
+
+                for s in range(spin):
+                    idx_lhs = [slice(None)] * sigma.ndim
+                    idx_rhs = [slice(None)] * E.ndim
+
+                    for state_no, state_r_no, k, l, parity in particle['states_r'][s][k_block][l_block]:
+                        idx_rhs[tensor_idx + s] = state_no
+                        idx_lhs[tensor_idx + s] = state_r_no
+
+                        idx_rhs[-2], idx_rhs[-1] = k - k_offset, l - l_offset
+
+                        idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
+
+                        sigma[idxt_lhs] += E[idxt_rhs] * parity
+
+
+
+
 
     # Coulomb interactions between
     for symb1, symb2 in itertools.combinations(particles, 2):
@@ -501,44 +559,83 @@ def matvec(v):
         spin1 = particle1['properties']['spin']
         spin2 = particle2['properties']['spin']
 
+        blocks1 = particle1['blocks']
+        blocks2 = particle2['blocks']
+
         cmb_int = full_cmb_int[fbi1:fbi1+obtl1, fbi1:fbi1+obtl1, fbi2:fbi2+obtl2, fbi2:fbi2+obtl2]
 
         if args.gpu:
             cmb_int = cp.asarray(cmb_int)
 
-        D = cp.zeros(tuple(string_mtx_shape) + (obtl2, obtl2))
+        for a_block, b_block in np.ndindex((blocks2, blocks2)):
+            a_offset = a_block * ij_blocksize
+            b_offset = b_block * ij_blocksize
 
-        for s2 in range(spin2):
-            idx_lhs = [slice(None)] * D.ndim
-            idx_rhs = [slice(None)] * C.ndim
+            a_end = a_offset + ij_blocksize
+            b_end = b_offset + ij_blocksize
 
-            for state_no, (state, states_r) in enumerate(zip(particle2['states'][s2], particle2['states_r'][s2])):
-                idx_lhs[tensor_idx2 + s2] = state_no
-                for state_r_no, a, b, parity in states_r:
+            if a_end > obtl2: # if edge blokc
+                a_len = obtl2 - a_offset
+                a_end = obtl2
+            else:
+                a_len = ij_blocksize
+
+            if b_end > obtl2:
+                b_len = obtl2 - b_offset
+                b_end = obtl2
+            else:
+                b_len = ij_blocksize
+
+            D = cp.zeros(tuple(string_mtx_shape) + (a_len, b_len))
+
+            for s2 in range(spin2):
+                idx_lhs = [slice(None)] * D.ndim
+                idx_rhs = [slice(None)] * C.ndim
+
+                for state_no, state_r_no, a, b, parity in particle2['states_r'][s2][a_block][b_block]:
+                    idx_lhs[tensor_idx2 + s2] = state_no
                     idx_rhs[tensor_idx2 + s2] = state_r_no
 
-                    idx_lhs[-2], idx_lhs[-1] = a, b
+                    idx_lhs[-2], idx_lhs[-1] = a - a_offset, b - b_offset
 
                     idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
 
                     D[idxt_lhs] += C[idxt_rhs] * parity
 
-        E = cp.tensordot(D, cmb_int, axes=([-2, -1], [-2, -1]))
+            for i_block, j_block in np.ndindex((blocks1, blocks1)):
+                i_offset = i_block * ij_blocksize
+                j_offset = j_block * ij_blocksize
 
-        for s1 in range(spin1):
-            idx_lhs = [slice(None)] * sigma.ndim
-            idx_rhs = [slice(None)] * E.ndim
+                i_end = i_offset + ij_blocksize
+                j_end = j_offset + ij_blocksize
 
-            for state_no, (state, states_r) in enumerate(zip(particle1['states'][s1], particle1['states_r'][s1])):
-                idx_rhs[tensor_idx1 + s1] = state_no
-                for state_r_no, i, j, parity in states_r:
-                    idx_lhs[tensor_idx1 + s1] = state_r_no
+                if i_end > obtl1:  # if edge blokc
+                    i_len = obtl1 - i_offset
+                    i_end = obtl1
+                else:
+                    i_len = ij_blocksize
 
-                    idx_rhs[-2], idx_rhs[-1] = i, j
+                if j_end > obtl1:
+                    j_len = obtl1 - j_offset
+                    j_end = obtl1
+                else:
+                    j_len = ij_blocksize
 
-                    idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
+                E = cp.tensordot(D, cmb_int[i_offset:i_end, j_offset:j_end, a_offset:a_end, b_offset:b_end], axes=([-2, -1], [-2, -1]))
 
-                    sigma[idxt_lhs] += E[idxt_rhs] * parity
+                for s1 in range(spin1):
+                    idx_lhs = [slice(None)] * sigma.ndim
+                    idx_rhs = [slice(None)] * E.ndim
+
+                    for state_no, state_r_no, i, j, parity in particle1['states_r'][s1][i_block][j_block]:
+                        idx_rhs[tensor_idx1 + s1] = state_no
+                        idx_lhs[tensor_idx1 + s1] = state_r_no
+
+                        idx_rhs[-2], idx_rhs[-1] = i - i_offset, j - j_offset
+
+                        idxt_lhs, idxt_rhs = tuple(idx_lhs), tuple(idx_rhs)
+
+                        sigma[idxt_lhs] += E[idxt_rhs] * parity
 
     if args.gpu:
         sigma = cp.asnumpy(sigma)
