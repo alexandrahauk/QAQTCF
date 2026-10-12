@@ -18,7 +18,7 @@ from scipy.linalg import block_diag
 
 from pyscf import gto, scf
 from pyscf.lo import orth
-from pyscf.lib.linalg_helper import davidson
+from pyscf.lib.linalg_helper import davidson1
 
 from gbasis.wrappers import from_pyscf
 from gbasis.parsers import parse_nwchem
@@ -39,7 +39,8 @@ parser.add_argument('n_basis_set')
 
 parser.add_argument('-t', '--truncate', help='Number of electronic SCF orbitals to truncate', type=int) # truncate
 parser.add_argument('-g', '--gpu', help='Use GPU acceleration with cupy', action='store_true') # truncate
-parser.add_argument('-e', '--eigs', help='Number of eigenvectors/values to calculate during iterative procedure')
+parser.add_argument('-e', '--eigs', help='Number of eigenvectors/values to calculate during iterative procedure', type=int)
+parser.add_argument('-n', '--nucmol')
 
 args = parser.parse_args()
 
@@ -57,6 +58,13 @@ else:
 # Load properties of all possible particles (spin, fermion/boson, mass, charge, etc)
 with open(particle_properties_file, "r") as file:
     particle_properties = json.load(file)
+
+print("Electronic basis set:", args.e_basis_set)
+print("Nuclear basis set:", args.n_basis_set)
+print("Mol file:", args.mol_xyz),
+if args.nucmol is not None:
+    print('Nucmol file:', args.nucmol)
+print("Spin file:", args.spin_file)
 
 # Build molecule for PySCF
 mol = gto.Mole()
@@ -78,8 +86,18 @@ n_basis_dict = parse_nwchem(basis_sets_dir + '/nuclear/' + args.n_basis_set + '.
 # Note: we will use the order of the dictionary. Python 3.7+ guarantees when we iterate, the dictionary will be ordered according to when the elements were added.
 particles = {}
 
-for i in range(mol.natm):
-    symb = mol.atom_symbol(i)
+if args.nucmol is None:
+    nucmol = mol
+
+else:
+    nucmol = gto.Mole()
+    nucmol.atom = args.nucmol
+    nucmol.build()
+
+nucmol_coords = nucmol.atom_coords()
+
+for i in range(nucmol.natm):
+    symb = nucmol.atom_symbol(i)
     # If this is a particle type (nucleus) we haven't seen before
     if symb not in particles:
         # Add it to particle list
@@ -88,7 +106,7 @@ for i in range(mol.natm):
         particles[symb]['count'] = 0
 
     # Add its coordinates to the list
-    particles[symb]['coords'].append(mol_coords[i])
+    particles[symb]['coords'].append(nucmol_coords[i])
 
     particles[symb]['count'] += 1
 
@@ -290,8 +308,10 @@ for symb1 in particles:
 
         full_cmb_int[fbi1:fbi1+obtl1, fbi1:fbi1+obtl1, fbi2:fbi2+obtl2, fbi2:fbi2+obtl2] *= charge1 * charge2 * half
 
-
-
+# Construct KE ints
+for symb in particles:
+    particle = particles[symb]
+    particle['ke_int'] = kinetic_energy_integral(particle['basis'], transform=particle['transform']) / particle['properties']['mass']
 
 # Construct single replacements
 for symb in particles:
@@ -380,7 +400,6 @@ def matvec(v):
         C = cp.asarray(C)
 
     sigma = cp.zeros(string_mtx_shape)
-    sigma2 = cp.zeros(string_mtx_shape)
 
     for symb in particles:
         particle = particles[symb]
@@ -391,9 +410,8 @@ def matvec(v):
         spin = particle['properties']['spin']
 
         obtl = particle['no_spatial_orbitals']
-
-        ke_int = kinetic_energy_integral(particle['basis'], transform=particle['transform']) / mass
         cmb_int = full_cmb_int[fbi:fbi+obtl, fbi:fbi+obtl, fbi:fbi+obtl, fbi:fbi+obtl]
+        ke_int = particle['ke_int']
 
         if args.gpu:
             ke_int = cp.asarray(ke_int)
@@ -489,7 +507,6 @@ def matvec(v):
             cmb_int = cp.asarray(cmb_int)
 
         D = cp.zeros(tuple(string_mtx_shape) + (obtl2, obtl2))
-        E = cp.zeros(tuple(string_mtx_shape) + (obtl1, obtl1))
 
         for s2 in range(spin2):
             idx_lhs = [slice(None)] * D.ndim
@@ -533,15 +550,20 @@ def matvec(v):
 #H = LinearOperator(shape=(total_states, total_states), matvec=matvec, dtype=float)
 #h_eigvals, h_eigvecs = sp.sparse.linalg.eigsh(H, k=args.eigs, which='SA', tol=1e-10, maxiter=250)
 
-x0 = np.zeros(total_states)
-x0[0] = 1
+#min_diag_idxs = np.argpartition(H_diag, 2*args.eigs)[:2*args.eigs]
+min_diag_idxs = np.arange(args.eigs)
 
-h_eigvals, h_eigvecs = davidson(matvec, x0, H_diag, nroots=args.eigs)
+x0s = np.zeros((args.eigs, total_states))
+for num, idx in enumerate(min_diag_idxs):
+    x0s[num][idx] = 1
+
+conv, h_eigvals, h_eigvecs = davidson1(lambda xs: [matvec(x) for x in xs], x0s, H_diag, nroots=args.eigs, max_memory=1000, max_cycle=400)
 
 diag_time = time.perf_counter()
 
 print(f"Iterative diagonalization completed in {diag_time-diag_elmts_time:.1f}s")
 
+print(conv)
 print(h_eigvals)
 
 np.savetxt('eigvals.dat', h_eigvals, delimiter=',', fmt='%f')
